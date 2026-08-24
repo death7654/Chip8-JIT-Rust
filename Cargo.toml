@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 cranelift = "0.134.3"
 dynasm = "5.1.0"
+dynasmrt = "5.1.0"
+sdl2 = { version = "0.37.0", features = ["bundled"] }
 
 [dependencies.windows-sys]
 version = "0.61.2"

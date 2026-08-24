@@ -8,6 +8,8 @@ use windows_sys::Win32::System::Memory::{
 };
 const PAGE_SIZE: usize = 4096;
 
+const CODE_ARENA_SIZE: usize = 64 * 1024;
+
 // emulator features
 const HEIGHT: usize = 64;
 const WIDTH: usize = 32;
@@ -33,7 +35,6 @@ const FONT_SET: [u8; FONTSIZE] = [
 ];
 
 #[repr(C)] // needed as our jit will interact with the register array
-#[repr(C)]
 pub struct CPU {
     instruction_cache: [*const u8; 0x1000], // 32,768 B
 
@@ -47,7 +48,7 @@ pub struct CPU {
     pub delay_timer: u8, // 1 B  (60Hz Delay Timer)
     pub sound_timer: u8, // 1 B  (60Hz Sound Timer)
 
-    ram: [u8; 0x1000], // 4,096 B
+    pub ram: [u8; 0x1000], // 4,096 B
 
     pub gfx: [u8; HEIGHT * WIDTH], // 2,048 B
 
@@ -59,28 +60,25 @@ pub struct CPU {
 
 impl CPU {
     pub fn new() -> CPU {
-        // Allocate 64 KB of executable (RWX) memory up front from Windows
-        let arena_size = 64 * 1024;
         let code_buffer = unsafe {
             VirtualAlloc(
                 std::ptr::null_mut(),
-                arena_size,
+                CODE_ARENA_SIZE,
                 MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
+                PAGE_READWRITE, // start writable; flipped to RX before anything executes
             ) as *mut u8
         };
 
-        // Ensure OS allocation succeeded
         assert!(
             !code_buffer.is_null(),
-            "FATAL: Failed to allocate RWX memory arena via VirtualAlloc"
+            "FATAL: Failed to allocate memory arena via VirtualAlloc"
         );
 
         let mut cpu = CPU {
             instruction_cache: [std::ptr::null_mut(); 0x1000],
             v: [0; 16],
             i: 0,
-            pc: 0x200, // CHIP-8 programs start loading at 0x200
+            pc: 0x200,
             stack: [0; 16],
             sp: 0,
             delay_timer: 0,
@@ -92,13 +90,11 @@ impl CPU {
             keys: [false; 16],
         };
 
-        // Load font set into RAM memory starting at offset 0x050
         cpu.ram[0x050..0x050 + FONT_SET.len()].copy_from_slice(&FONT_SET);
-
         cpu
     }
 
-    fn compile(&mut self, instruction: u16, cpu: CPU) {
+    fn compile(&mut self, instruction: u16, pc: u16) -> *const u8 {
         let op = ((instruction >> 12) & 0x0F) as u8;
 
         // standard instruction formats
@@ -144,13 +140,14 @@ impl CPU {
                     /* Clear screen */
                     dynasm!(ops
                         ; .arch x64
-                        ; lea r8, [rcx + gfx_offset] // point r8 to the gfx offset, rcx holds the CPU struct
-                        ; xor rax, rax               // set rax to 0
-                        ; mov r9d, 0                 // set counter offset to zero
+                        ; lea r8, [rcx + gfx_offset]
+                        ; xor rax, rax
+                        ; mov r9d, 0
                         ; -> clear_loop:
-                        ; mov [r8 + r9], rax         // write 8 zero bytes at once
-                        ; add r9, 8                  // advance offset by 8
-                        ; jne -> clear_loop
+                        ; mov [r8 + r9], rax
+                        ; add r9, 8
+                        ; cmp r9, (HEIGHT * WIDTH) as i32
+                        ; jl -> clear_loop
                         ; ret
                     )
                 }
@@ -159,16 +156,16 @@ impl CPU {
                     dynasm!(ops
                         ; .arch x64
                         // Decrement SP
-                        ; dec byte ptr [rcx + (sp_offset)]
+                        ; dec BYTE [rcx + (sp_offset)]
 
                         // Zero-extend SP into RAX to use as an array index
-                        ; movzx rax, byte ptr [rcx + (sp_offset)]
+                        ; movzx rax, BYTE [rcx + (sp_offset)]
 
                         // Load return address from stack[sp] (scaled by 2 bytes per u16)
-                        ; mov dx, word ptr [rcx + rax*2 + (stack_offset)]
+                        ; mov dx, WORD [rcx + rax*2 + (stack_offset)]
 
                         // Update PC with the return address
-                        ; mov word ptr [rcx + (pc_offset)], dx
+                        ; mov WORD [rcx + (pc_offset)], dx
                         ; ret
                     )
                 }
@@ -178,27 +175,27 @@ impl CPU {
                 /* 1NNN: JP nnn - Jump to address NNN */
                 dynasm!(ops
                     ; .arch x64
-                    ; mov word ptr [rcx + (pc_offset)], nnn as i32
+                    ; mov WORD [rcx + (pc_offset as i32)], (nnn as i16)
                     ; ret
-                )
+                );
             }
             0x2 => {
                 /* 2NNN: CALL nnn - Call subroutine at NNN */
-                let return_pc = (pc + 2) as i32;
+                let return_pc = (pc + 2) as i16;
                 dynasm!(ops
                     ; .arch x64
 
                     // Zero-extend current SP into RAX to use as array index
-                    ; movzx rax, byte ptr [rcx + (sp_offset)]
+                    ; movzx eax, BYTE [rcx + (sp_offset as i32)]
 
                     // Save return address (PC + 2) into stack[SP]
-                    ; mov word ptr [rcx + rax*2 + (stack_offset)], return_pc
+                    ; mov WORD [rcx + rax*2 + (stack_offset)], return_pc
 
                     // Increment SP (ready for next call)
-                    ; inc byte ptr [rcx + (sp_offset)]
+                    ; inc BYTE [rcx + (sp_offset)]
 
                     // Jump to subroutine address NNN
-                    ; mov word ptr [rcx + (pc_offset)], nnn as i32
+                    ; mov WORD [rcx + (pc_offset)], nnn as i16
                     ; ret
                 );
             }
@@ -206,22 +203,22 @@ impl CPU {
                 /* 3XNN: SE Vx, kk - Skip next instruction if Vx == KK */
                 dynasm!(ops
                     ; .arch x64
-                    ; mov al, byte ptr [rcx + (vx_offset)]
-                    ; cmp al, kk as i32
+                    ; mov al, BYTE [rcx + (vx_offset)]
+                    ; cmp al, kk as i8
                     ; jne -> end
-                    ; add word ptr [rcx + (pc_offset)], 2 // Extra +2 skip
+                    ; add WORD [rcx + (pc_offset)], 2 // Extra +2 skip
                     ; -> end:
                     ; ret
                 );
             }
             0x4 => {
                 /* 4XNN: SNE Vx, kk - Skip next instruction if Vx != KK */
-                dynasm!(op
+                dynasm!(ops
                 ; .arch x64
-                ; mov al, byte ptr [rcx + (vx_offset)]
-                ; cmp al, kk as i32
+                ; mov al, BYTE [rcx + (vx_offset)]
+                ; cmp al, kk as i8
                 ; je -> end
-                ; add word ptr [rcx + (pc_offset)], 2 // Extra +2 skip
+                ; add WORD [rcx + (pc_offset)], 2 // Extra +2 skip
                 ; -> end:
                 ; ret
                 )
@@ -230,10 +227,10 @@ impl CPU {
                 /* 5XY0: SE Vx, Vy - Skip next instruction if Vx == Vy */
                 dynasm!(ops
                     ; .arch x64
-                    ; mov al, byte ptr [rcx + (vx_offset)]
-                    ; cmp al, byte ptr [rcx + (vy_offset)]
+                    ; mov al, BYTE [rcx + (vx_offset)]
+                    ; cmp al, BYTE [rcx + (vy_offset)]
                     ; jne -> end
-                    ; add word ptr [rcx + (pc_offset)], 2
+                    ; add WORD [rcx + (pc_offset)], 2
                     ; -> end:
                     ; ret
                 );
@@ -242,7 +239,7 @@ impl CPU {
                 /* 6XNN: LD Vx, kk - Set Vx = KK */
                 dynasm!(ops
                     ; .arch x64
-                    ; mov byte ptr [rcx + (vx_offset)], kk as i32
+                    ; mov BYTE [rcx + (vx_offset)], kk as i8
                     ; ret
                 );
             }
@@ -250,7 +247,7 @@ impl CPU {
                 /* 7XNN: ADD Vx, kk - Set Vx = Vx + KK */
                 dynasm!(ops
                     ; .arch x64
-                    ; add byte ptr [rcx + (vx_offset)], kk as i32
+                    ; add BYTE [rcx + (vx_offset)], kk as i8
                     ; ret
                 );
             }
@@ -259,8 +256,8 @@ impl CPU {
                     /* 8XY0: LD Vx, Vy - Set Vx = Vy */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vy_offset)]
-                        ; mov byte ptr [rcx + (vx_offset)], al
+                        ; mov al, BYTE [rcx + (vy_offset)]
+                        ; mov BYTE [rcx + (vx_offset)], al
                         ; ret
                     );
                 }
@@ -268,8 +265,8 @@ impl CPU {
                     /* 8XY1: OR Vx, Vy - Set Vx = Vx | Vy */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vy_offset)]
-                        ; or byte ptr [rcx + (vx_offset)], al
+                        ; mov al, BYTE [rcx + (vy_offset)]
+                        ; or BYTE [rcx + (vx_offset)], al
                         ; ret
                     )
                 }
@@ -277,8 +274,8 @@ impl CPU {
                     /* 8XY2: AND Vx, Vy - Set Vx = Vx & Vy */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vy_offset)]
-                        ; and byte ptr [rcx + (vx_offset)], al
+                        ; mov al, BYTE [rcx + (vy_offset)]
+                        ; and BYTE [rcx + (vx_offset)], al
                         ; ret
                     )
                 }
@@ -286,8 +283,8 @@ impl CPU {
                     /* 8XY3: XOR Vx, Vy - Set Vx = Vx ^ Vy */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vy_offset)]
-                        ; xor byte ptr [rcx + (vx_offset)], al
+                        ; mov al, BYTE [rcx + (vy_offset)]
+                        ; xor BYTE [rcx + (vx_offset)], al
                         ; ret
                     )
                 }
@@ -295,12 +292,12 @@ impl CPU {
                     /* 8XY4: ADD Vx, Vy - Set Vx = Vx + Vy, VF = carry */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]  // Load Vx into AL
-                        ; mov dl, byte ptr [rcx + (vy_offset)]  // Load Vy into DL
+                        ; mov al, BYTE [rcx + (vx_offset)]  // Load Vx into AL
+                        ; mov dl, BYTE [rcx + (vy_offset)]  // Load Vy into DL
                         ; add al, dl                            // AL = AL + DL (Updates x86 Carry Flag)
-                        ; mov byte ptr [rcx + (vx_offset)], al  // Store 8-bit result in Vx
+                        ; mov BYTE [rcx + (vx_offset)], al  // Store 8-bit result in Vx
                         ; setc al                               // AL = 1 if CF==1 else 0
-                        ; mov byte ptr [rcx + (vf_offset)], al  // Store carry flag in VF
+                        ; mov BYTE [rcx + (vf_offset)], al  // Store carry flag in VF
                         ; ret
                     );
                 }
@@ -308,12 +305,12 @@ impl CPU {
                     /* 8XY5: SUB Vx, Vy - Set Vx = Vx - Vy, VF = NOT borrow */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]  // Load Vx into AL
-                        ; mov dl, byte ptr [rcx + (vy_offset)]  // Load Vy into DL
+                        ; mov al, BYTE [rcx + (vx_offset)]  // Load Vx into AL
+                        ; mov dl, BYTE [rcx + (vy_offset)]  // Load Vy into DL
                         ; sub al, dl                            // AL = AL - DL (Sets x86 Carry/Borrow Flag)
-                        ; mov byte ptr [rcx + (vx_offset)], al  // Store 8-bit result in Vx
+                        ; mov BYTE [rcx + (vx_offset)], al  // Store 8-bit result in Vx
                         ; setnc al                              // AL = 1 if CF==0 (Vx >= Vy), AL = 0 if CF==1 (Vx < Vy)
-                        ; mov byte ptr [rcx + (vf_offset)], al  // Store NOT borrow flag in VF
+                        ; mov BYTE [rcx + (vf_offset)], al  // Store NOT borrow flag in VF
                         ; ret
                     );
                 }
@@ -321,11 +318,11 @@ impl CPU {
                     /* 8XY6: SHR Vx - Set Vx = Vx >> 1 */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]  // Load Vx into AL
+                        ; mov al, BYTE [rcx + (vx_offset)]  // Load Vx into AL
                         ; shr al, 1                             // AL = AL >> 1
-                        ; mov byte ptr [rcx + (vx_offset)], al  // Store shifted value in Vx
+                        ; mov BYTE [rcx + (vx_offset)], al  // Store shifted value in Vx
                         ; setc al                               // Copy Carry Flag (the LSB) into AL
-                        ; mov byte ptr [rcx + (vf_offset)], al  // Store LSB in VF
+                        ; mov BYTE [rcx + (vf_offset)], al  // Store LSB in VF
                         ; ret
                     );
                 }
@@ -333,12 +330,12 @@ impl CPU {
                     /* 8XY7: SUBN Vx, Vy - Set Vx = Vy - Vx, VF = NOT borrow */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]  // AL = Vx
-                        ; mov dl, byte ptr [rcx + (vy_offset)]  // DL = Vy
+                        ; mov al, BYTE [rcx + (vx_offset)]  // AL = Vx
+                        ; mov dl, BYTE [rcx + (vy_offset)]  // DL = Vy
                         ; sub dl, al                            // DL = Vy - Vx (Updates x86 Carry/Borrow Flag)
-                        ; mov byte ptr [rcx + (vx_offset)], dl  // Store result (DL) into Vx
+                        ; mov BYTE [rcx + (vx_offset)], dl  // Store result (DL) into Vx
                         ; setnc dl                              // DL = 1 if CF==0 (Vy >= Vx), 0 if CF==1 (Vy < Vx)
-                        ; mov byte ptr [rcx + (vf_offset)], dl  // Store NOT borrow flag (DL) into VF
+                        ; mov BYTE [rcx + (vf_offset)], dl  // Store NOT borrow flag (DL) into VF
                         ; ret
                     );
                 }
@@ -346,11 +343,11 @@ impl CPU {
                     /* 8XYE: SHL Vx - Set Vx = Vx << 1 */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]  // Load Vx into AL
+                        ; mov al, BYTE [rcx + (vx_offset)]  // Load Vx into AL
                         ; shl al, 1                             // AL = AL << 1 (Old MSB moves into x86 Carry Flag)
-                        ; mov byte ptr [rcx + (vx_offset)], al  // Store shifted value in Vx
+                        ; mov BYTE [rcx + (vx_offset)], al  // Store shifted value in Vx
                         ; setc al                               // Copy Carry Flag (the MSB) into AL
-                        ; mov byte ptr [rcx + (vf_offset)], al  // Store MSB in VF
+                        ; mov BYTE [rcx + (vf_offset)], al  // Store MSB in VF
                         ; ret
                     );
                 }
@@ -360,10 +357,10 @@ impl CPU {
                 /* 9XY0: SNE Vx, Vy - Skip next instruction if Vx != Vy */
                 dynasm!(ops
                     ; .arch x64
-                    ; mov al, byte ptr [rcx + (vx_offset)]
-                    ; cmp al, byte ptr [rcx + (vy_offset)]
+                    ; mov al, BYTE [rcx + (vx_offset)]
+                    ; cmp al, BYTE [rcx + (vy_offset)]
                     ; je -> end
-                    ; add word ptr [rcx + (pc_offset)], 2
+                    ; add WORD [rcx + (pc_offset)], 2
                     ; -> end:
                     ; ret
                 );
@@ -372,7 +369,7 @@ impl CPU {
                 /* ANNN: LD I, nnn - Set I = NNN */
                 dynasm!(ops
                     ; .arch x64
-                    ; mov word ptr [rcx + (i_offset)], nnn as i32
+                    ; mov WORD [rcx + (i_offset)], nnn as i16
                     ; ret
                 );
             }
@@ -380,9 +377,9 @@ impl CPU {
                 /* BNNN: JP V0, nnn - Jump to address NNN + V0 */
                 dynasm!(ops
                     ; .arch x64
-                    ; movzx rax, word ptr [rcx + (v_offset)]
+                    ; movzx rax, BYTE [rcx + (v_offset)]
                     ; add rax, nnn as i32
-                    ; mov word ptr [rcx + (pc_offset)], ax
+                    ; mov WORD [rcx + (pc_offset)], ax
                     ; ret
                 )
             }
@@ -390,9 +387,9 @@ impl CPU {
                 /* CXNN: RND Vx, kk - Set Vx = random byte AND KK */
                 dynasm!(ops
                     ; .arch x64
-                    ; rdrand eax                            // CPU fills EAX with hardware random bits
-                    ; and al, nn as i32                     // AL = random_byte & NN
-                    ; mov byte ptr [rcx + (vx_offset)], al  // Store result in Vx
+                    ; rdrand rax                            // CPU fills EAX with hardware random bits
+                    ; and al, kk as i8                     // AL = random_byte & NN
+                    ; mov BYTE [rcx + (vx_offset)], al  // Store result in Vx
                     ; ret
                 );
             }
@@ -406,19 +403,19 @@ impl CPU {
                     ; .arch x64
                     // Pass Arguments via Windows x64 ABI
                     // RCX is already pointing to *mut CPU (Arg 1)
-                    ; mov dl, byte ptr [rcx + (vx_offset)]   // Arg 2: Vx (DL)
-                    ; mov r8b, byte ptr [rcx + (vy_offset)]  // Arg 3: Vy (R8B)
-                    ; mov r9b, n as i32                      // Arg 4: N (R9B)
+                    ; mov dl, BYTE [rcx + (vx_offset)]   // Arg 2: Vx (DL)
+                    ; mov r8b, BYTE [rcx + (vy_offset)]  // Arg 3: Vy (R8B)
+                    ; mov r9b, n as i8                      // Arg 4: N (R9B)
 
                     // Allocate 32-byte shadow space required by Windows ABI
-                    ; sub rsp, 32
+                    ; sub rsp, 40
 
                     // Call Rust helper function
                     ; mov rax, QWORD fn_ptr // qword = 32 bit
                     ; call rax
 
                     // Clean up stack frame
-                    ; add rsp, 32
+                    ; add rsp, 40
                     ; ret
                 );
             }
@@ -427,11 +424,11 @@ impl CPU {
                     /* EX9E: SKP Vx - Skip next instruction if key in Vx is pressed */
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx rax, byte ptr [rcx + (vx_offset)]
+                        ; movzx rax, BYTE [rcx + (vx_offset)]
                         ; and rax, 0x0F
-                        ; cmp byte ptr [rcx + rax + (keys_offset)], 0
+                        ; cmp BYTE [rcx + rax + (keys_offset)], 0
                         ; je -> end                                   // If NOT pressed (0), don't skip
-                        ; add word ptr [rcx + (pc_offset)], 2         // Pressed: advance PC by +2 (skip)
+                        ; add WORD [rcx + (pc_offset)], 2         // Pressed: advance PC by +2 (skip)
                         ; -> end:
                         ; ret
                     )
@@ -440,11 +437,11 @@ impl CPU {
                     /* EXA1: SKNP Vx - Skip next instruction if key in Vx is NOT pressed */
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx rax, byte ptr [rcx + (vx_offset)]
+                        ; movzx rax, BYTE [rcx + (vx_offset)]
                         ; and rax, 0x0F
-                        ; cmp byte ptr [rcx + rax + (keys_offset)], 0
+                        ; cmp BYTE [rcx + rax + (keys_offset)], 0
                         ; jne -> end
-                        ; add word ptr [rcx + (pc_offset)], 2
+                        ; add WORD [rcx + (pc_offset)], 2
                         ; -> end:
                         ; ret
                     )
@@ -456,8 +453,8 @@ impl CPU {
                     /* FX07: LD Vx, DT - Set Vx = delay timer value */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (delay_timer_offset)]
-                        ; mov byte ptr [rcx + (vx_offset)], al
+                        ; mov al, BYTE [rcx + (delay_timer_offset)]
+                        ; mov BYTE [rcx + (vx_offset)], al
                         ; ret
                     )
                 }
@@ -468,19 +465,19 @@ impl CPU {
                         ; xor rax, rax                              // RAX = 0 (key index counter)
 
                         ; -> check_key:
-                        ; cmp byte ptr [rcx + rax + (keys_offset)], 0 // Is keys[RAX] pressed?
+                        ; cmp BYTE [rcx + rax + (keys_offset)], 0 // Is keys[RAX] pressed?
                         ; jne -> key_pressed                        // Found a pressed key! Jump out.
                         ; inc rax                                   // RAX++
                         ; cmp rax, 16                               // Checked all 16 keys?
                         ; jl -> check_key                           // Loop if RAX < 16
 
                         //  No key was pressed
-                        ; sub word ptr [rcx + (pc_offset)], 2       // Rewind PC to re-execute FX0A next frame
+                        ; sub WORD [rcx + (pc_offset)], 2       // Rewind PC to re-execute FX0A next frame
                         ; ret
 
                         //  Key was pressed
                         ; -> key_pressed:
-                        ; mov byte ptr [rcx + (vx_offset)], al      // Store key index (AL) into Vx
+                        ; mov BYTE [rcx + (vx_offset)], al      // Store key index (AL) into Vx
                         ; ret
                     );
                 }
@@ -488,8 +485,8 @@ impl CPU {
                     /* FX15: LD DT, Vx - Set delay timer = Vx */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]
-                        ; mov byte ptr [rcx + (delay_timer_offset)], al
+                        ; mov al, BYTE [rcx + (vx_offset)]
+                        ; mov BYTE [rcx + (delay_timer_offset)], al
                         ; ret
                     )
                 }
@@ -497,8 +494,8 @@ impl CPU {
                     /* FX18: LD ST, Vx - Set sound timer = Vx */
                     dynasm!(ops
                         ; .arch x64
-                        ; mov al, byte ptr [rcx + (vx_offset)]
-                        ; mov byte ptr [rcx + (sound_timer_offset)], al
+                        ; mov al, BYTE [rcx + (vx_offset)]
+                        ; mov BYTE [rcx + (sound_timer_offset)], al
                         ; ret
                     )
                 }
@@ -506,8 +503,8 @@ impl CPU {
                     /* FX1E: ADD I, Vx - Set I = I + Vx */
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx al, byte ptr [rcx + (vx_offset)]
-                        ; add word ptr[rcx + (i_offset)], al
+                        ; movzx ax, BYTE [rcx + (vx_offset)]
+                        ; add WORD[rcx + (i_offset)], ax
                         ; ret
                     )
                 }
@@ -515,11 +512,11 @@ impl CPU {
                     /* FX29: LD F, Vx - Set I = location of sprite for digit Vx */
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx rax, byte ptr [rcx + (vx_offset)]  // Load Vx into RAX, zero-extended
-                        ; and rax, 0x0F                            // Mask lower 4 bits (digits 0..F)
-                        ; imul ax, ax, 5                           // AX = digit * 5 bytes per character
-                        // ; add ax, 0x50                          // Uncomment if font is loaded at 0x0050 in RAM
-                        ; mov word ptr [rcx + (i_offset)], ax      // Store 16-bit address into I
+                        ; movzx rax, BYTE [rcx + (vx_offset)]
+                        ; and rax, 0x0F
+                        ; imul ax, ax, 5
+                        ; add ax, 0x50
+                        ; mov WORD [rcx + (i_offset)], ax
                         ; ret
                     );
                 }
@@ -527,33 +524,32 @@ impl CPU {
                     /* FX33: LD B, Vx - Store BCD representation of Vx in I, I+1, I+2 */
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx ax, byte ptr [rcx + (vx_offset)]      // AX = Vx (0..255)
-                        ; movzx r8, word ptr [rcx + (i_offset)]       // R8 = I
+                        ; movzx ax, BYTE [rcx + (vx_offset)]      // AX = Vx (0..255)
+                        ; movzx r8, WORD [rcx + (i_offset)]       // R8 = I
                         ; and r8, 0xFFF                               // Mask address to 4KB RAM bounds
                         ; lea rdx, [rcx + r8 + (ram_offset)]          // RDX = &ram[I]
 
                         // --- Hundreds Digit ---
                         ; mov bl, 100
                         ; div bl                                      // AL = AX / 100 (Hundreds), AH = AX % 100
-                        ; mov byte ptr [rdx], al                      // ram[I] = Hundreds
+                        ; mov BYTE [rdx], al                      // ram[I] = Hundreds
 
                         // --- Tens & Ones Digits ---
                         ; mov al, ah                                  // AL = remainder (0..99)
                         ; mov ah, 0                                   // Clear AH so AX = remainder
                         ; mov bl, 10
                         ; div bl                                      // AL = AX / 10 (Tens), AH = AX % 10 (Ones)
-                        ; mov byte ptr [rdx + 1], al                  // ram[I+1] = Tens
-                        ; mov byte ptr [rdx + 2], ah                  // ram[I+2] = Ones
+                        ; mov BYTE [rdx + 1], al                  // ram[I+1] = Tens
+                        ; mov BYTE [rdx + 2], ah                  // ram[I+2] = Ones
                         ; ret
                     );
                 }
                 0x55 => {
                     /* FX55: LD [I], Vx - Store registers V0 through Vx in memory starting at I */
-                    let ram_offset = std::mem::offset_of!(CPU, ram) as i32;
 
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx rax, word ptr [rcx + (i_offset)]       // RAX = I
+                        ; movzx rax, WORD [rcx + (i_offset)]       // RAX = I
                         ; and rax, 0xFFF                               // Mask address to 4KB RAM bounds
                     );
 
@@ -563,8 +559,8 @@ impl CPU {
                         let offset = ram_offset + reg as i32;
                         dynasm!(ops
                             ; .arch x64
-                            ; mov dl, byte ptr [rcx + (v_reg_offset)] // Load V[reg] into DL
-                            ; mov byte ptr [rcx + rax + (offset)], dl // Store into ram[I + reg]
+                            ; mov dl, BYTE [rcx + (v_reg_offset)] // Load V[reg] into DL
+                            ; mov BYTE [rcx + rax + (offset)], dl // Store into ram[I + reg]
                         );
                     }
 
@@ -575,11 +571,10 @@ impl CPU {
                 }
                 0x65 => {
                     /* FX65: LD Vx, [I] - Read memory starting at I into registers V0 through Vx */
-                    let ram_offset = std::mem::offset_of!(CPU, ram) as i32;
 
                     dynasm!(ops
                         ; .arch x64
-                        ; movzx rax, word ptr [rcx + (i_offset)]       // RAX = I
+                        ; movzx rax, WORD [rcx + (i_offset)]       // RAX = I
                         ; and rax, 0xFFF                               // Mask address to 4KB RAM bounds
                     );
 
@@ -589,8 +584,8 @@ impl CPU {
                         let offset = ram_offset + reg as i32;
                         dynasm!(ops
                             ; .arch x64
-                            ; mov dl, byte ptr [rcx + rax + (offset)] // Load byte from ram[I + reg]
-                            ; mov byte ptr [rcx + (v_reg_offset)], dl // Store into V[reg]
+                            ; mov dl, BYTE [rcx + rax + (offset)] // Load byte from ram[I + reg]
+                            ; mov BYTE [rcx + (v_reg_offset)], dl // Store into V[reg]
                         );
                     }
 
@@ -603,21 +598,59 @@ impl CPU {
             },
             _ => {}
         }
-    }
-    pub fn execute(&mut self) {
-        println!("execute");
-        return;
-        let pc = self.pc as usize;
-        self.pc += 2;
 
-        let opcode = ((self.ram[pc] as u16) << 8) | (self.ram[pc + 1] as u16);
+        let dest_ptr = unsafe { self.code_buffer.add(self.code_offset) };
+        let exec_buffer: dynasmrt::ExecutableBuffer = ops.finalize().unwrap();
+        let code_bytes: &[u8] = &exec_buffer;
+        let len = code_bytes.len();
 
-        if self.instruction_cache[pc].is_null() {
-            self.compile(opcode, pc);
-        }
+        assert!(
+            self.code_offset + len <= CODE_ARENA_SIZE,
+            "JIT code arena exhausted"
+        );
 
         unsafe {
-            let func: extern "C" fn(*mut CPU) = mem::transmute(self.instruction_cache[pc]);
+            let mut old_protect = 0u32;
+
+            // Arena may currently be RX from a previous compile; make it writable again.
+            VirtualProtect(
+                self.code_buffer as *const c_void,
+                CODE_ARENA_SIZE,
+                PAGE_READWRITE,
+                &mut old_protect,
+            );
+
+            std::ptr::copy_nonoverlapping(code_bytes.as_ptr(), dest_ptr, len);
+
+            // Flip back to executable before anyone calls into it.
+            VirtualProtect(
+                self.code_buffer as *const c_void,
+                CODE_ARENA_SIZE,
+                PAGE_EXECUTE_READ,
+                &mut old_protect,
+            );
+        }
+
+        self.code_offset += len;
+        self.instruction_cache[pc as usize] = dest_ptr;
+        dest_ptr
+    }
+    pub fn execute(&mut self) {
+        let pc = self.pc & 0x0FFE;
+        self.pc = pc.wrapping_add(2);
+
+        let opcode = ((self.ram[pc as usize] as u16) << 8) | (self.ram[pc as usize + 1] as u16);
+        // eprintln!("pc={:#05x} opcode={:#06x}", pc, opcode); // TEMP
+
+
+        let func_ptr = if self.instruction_cache[pc as usize].is_null() {
+            self.compile(opcode, pc)
+        } else {
+            self.instruction_cache[pc as usize]
+        };
+
+        unsafe {
+            let func: extern "C" fn(*mut CPU) = mem::transmute(func_ptr);
             func(self as *mut CPU);
         }
     }
