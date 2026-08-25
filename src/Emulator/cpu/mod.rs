@@ -21,7 +21,7 @@ const FONTSIZE: usize = 80;
    native block. Prevents a pathological/self-looping ROM (or a run of
    straight-line code that never hits a control-flow instruction) from
    producing an unbounded native function or exhausting the code arena
-   in one compile() call. 
+   in one compile() call.
 */
 const MAX_BLOCK_INSTRUCTIONS: usize = 512;
 
@@ -41,7 +41,6 @@ impl TimerState {
     }
 }
 
-
 #[repr(C)] // needed as our jit will interact with the register array
 pub struct CPU {
     v: [u8; 16], // 16 B
@@ -55,9 +54,9 @@ pub struct CPU {
 
     pub gfx: [u8; HEIGHT * WIDTH], // 2,048 B
 
-    code_buffer: *mut u8, // Host JIT buffer ptr
-    code_offset: usize,   // Bump allocator index
-    pub keys: [bool; 16], // keypad input
+    code_buffer: *mut u8,                   // Host JIT buffer ptr
+    code_offset: usize,                     // Bump allocator index
+    pub keys: [bool; 16],                   // keypad input
     instruction_cache: [*const u8; 0x1000], // 32,768 B
 }
 
@@ -94,7 +93,6 @@ impl CPU {
         cpu.ram[0x050..0x050 + fonts.len()].copy_from_slice(fonts);
         cpu
     }
-
 
     fn compile(&mut self, start_pc: u16) -> *const u8 {
         let mut pc = start_pc;
