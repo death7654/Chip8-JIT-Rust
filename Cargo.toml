@@ -14,3 +14,11 @@ version = "0.61.2"
 features = [
     "Win32_System_Memory",
 ]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+strip = true
